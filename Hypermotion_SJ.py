@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from bs4 import BeautifulSoup
 from xgboost import XGBRegressor
-from sklearn.model_selection import GridSearchCV # El juez que evalúa el sobreajuste
+from sklearn.model_selection import GridSearchCV
 import time
 import warnings
 
