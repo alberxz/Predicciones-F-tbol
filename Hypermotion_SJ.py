@@ -3,7 +3,7 @@ import json
 import pandas as pd
 import numpy as np
 from bs4 import BeautifulSoup
-from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor # EL NUEVO MOTOR FÓRMULA 1
 import time
 
 # =====================================================================
@@ -50,7 +50,6 @@ def estructurar_fisica_de_particulas(equipos_crudos):
         pj = stats.get('games_played', 1)
         if pj == 0: continue
             
-        # DEFINICIÓN DE LOS 7 TARGETS (Lo que queremos predecir) normalizados por partido
         fila = {
             'Equipo': nombre,
             'target_goals': stats.get('goals', 0) / pj,
@@ -66,7 +65,6 @@ def estructurar_fisica_de_particulas(equipos_crudos):
         
         for clave, valor in stats.items():
             if clave not in columnas_trampa and 'goal' not in clave and isinstance(valor, (int, float)):
-                # Normalizamos métricas absolutas (excepto porcentajes y ratios)
                 if 'percentage' not in clave and 'accuracy' not in clave and 'ppda' not in clave:
                     fila[clave] = valor / pj
                 else:
@@ -78,15 +76,14 @@ def estructurar_fisica_de_particulas(equipos_crudos):
     return df
 
 # =====================================================================
-# MÓDULO 3: EL CEREBRO NO LINEAL (MÚLTIPLES BOSQUES ESTOCÁSTICOS)
+# MÓDULO 3: GRADIENT BOOSTING Y SUAVIZADO BAYESIANO DINÁMICO
 # =====================================================================
-def calcular_lambdas_por_bosque(df, local, visitante):
-    print("[3/4] Entrenando 7 Bosques Random Forest simultáneos (uno por métrica)...")
+def calcular_lambdas_xgboost(df, equipos_crudos, local, visitante):
+    print("[3/4] Entrenando XGBoost y calculando Sesgo Bayesiano Puro (Sin Topes Artificiales)...")
     
     targets = [c for c in df.columns if c.startswith('target_')]
     features = df.drop(columns=['Equipo'] + targets)
     
-    # Motor de búsqueda flexible (por si escribimos "Barsa" en vez de "FC Barcelona")
     def encontrar_equipo(buscado, lista):
         for n in lista:
             if buscado.lower() in n.lower(): return n
@@ -101,57 +98,94 @@ def calcular_lambdas_por_bosque(df, local, visitante):
     stats_L = df[df['Equipo'] == nom_L][features.columns]
     stats_V = df[df['Equipo'] == nom_V][features.columns]
     
+    # --- CALCULADORA BAYESIANA DINÁMICA ---
+    def calcular_sesgo_bayesiano(nombre_equipo, condicion='home'):
+        equipo_data = next((e for e in equipos_crudos if nombre_equipo.lower() in e['nick_name'].lower()), None)
+        
+        # El histórico base asume un 10% de ventaja local (1.10) y 10% desventaja visitante (0.90)
+        prior = 1.10 if condicion == 'home' else 0.90
+        if not equipo_data: return prior
+        
+        dic = {item['name']: item['stat'] for item in equipo_data['stats']}
+        
+        victorias_cond = sum(v for k, v in dic.items() if condicion in k.lower() and 'won' in k.lower())
+        goles_cond = sum(v for k, v in dic.items() if condicion in k.lower() and 'goal' in k.lower() and 'conceded' not in k.lower())
+        
+        victorias_totales = max(dic.get('won', 0.1), 0.1)
+        goles_totales = max(dic.get('goals', 0.1), 0.1)
+        pj_totales = max(dic.get('games_played', 1), 1)
+        
+        # Partidos jugados en la condición actual (aprox. la mitad)
+        N_condicion = pj_totales / 2.0
+        
+        # 1. Rendimiento puro: Lo que ha hecho / Lo que debería haber hecho si fuera simétrico
+        rendimiento_vic = victorias_cond / (victorias_totales / 2.0)
+        rendimiento_gol = goles_cond / (goles_totales / 2.0)
+        rendimiento_puro = (rendimiento_vic + rendimiento_gol) / 2.0 
+        
+        # 2. Fórmula del Peso Dinámico (K = 10 partidos de credibilidad)
+        K = 10.0
+        peso_realidad = N_condicion / (N_condicion + K)
+        peso_historico = K / (N_condicion + K)
+        
+        # 3. Fusión final: La matemática fluye sin topes.
+        multiplicador_final = (peso_realidad * rendimiento_puro) + (peso_historico * prior)
+        return max(0.5, multiplicador_final) # Solo evitamos multiplicadores negativos por seguridad
+
+    sesgo_L = calcular_sesgo_bayesiano(nom_L, 'home')
+    sesgo_V = calcular_sesgo_bayesiano(nom_V, 'away')
+    
+    print(f"      > [MOTOR BAYESIANO] {nom_L} (L): Multiplicador Espacial = {sesgo_L:.3f}x")
+    print(f"      > [MOTOR BAYESIANO] {nom_V} (V): Multiplicador Espacial = {sesgo_V:.3f}x")
+
     lambdas = {nom_L: {}, nom_V: {}}
     
-    # Entrenamos un bosque distinto para cada evento de la cascada
     for t in targets:
         metrica = t.replace('target_', '')
         
-        bosque = RandomForestRegressor(n_estimators=250, max_depth=5, random_state=42)
-        bosque.fit(features, df[t])
+        # EL FÓRMULA 1: Se corrigen los errores iteración a iteración
+        modelo = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42, objective='reg:squarederror')
+        modelo.fit(features, df[t])
         
-        # El bosque lee las 100 variables del Levante y predice su tasa bruta
-        lambda_L = float(bosque.predict(stats_L)[0])
-        lambda_V = float(bosque.predict(stats_V)[0])
+        lambda_L = float(modelo.predict(stats_L)[0])
+        lambda_V = float(modelo.predict(stats_V)[0])
         
-        # Efecto Espacial (Ventaja Local / Desventaja Visitante)
+        # APLICACIÓN DE LA FÍSICA ESPACIAL PURA
         if metrica in ['goals', 'shots', 'on_target', 'corners']:
-            lambdas[nom_L][metrica] = lambda_L * 1.10  # +10% producción local
-            lambdas[nom_V][metrica] = lambda_V * 0.90  # -10% producción visitante
+            lambdas[nom_L][metrica] = lambda_L * sesgo_L
+            lambdas[nom_V][metrica] = lambda_V * sesgo_V
         elif metrica == 'cards':
-            lambdas[nom_L][metrica] = lambda_L * 0.85  # -15% castigo local
-            lambdas[nom_V][metrica] = lambda_V * 1.15  # +15% castigo visitante
-        else: # Palos y penaltis (Más dependientes del azar puro, no aplicamos sesgo espacial fuerte)
+            # Simetría inversa: El que ataca y domina recibe menos tarjetas
+            lambdas[nom_L][metrica] = max(0.1, lambda_L * (2.0 - sesgo_L))
+            lambdas[nom_V][metrica] = max(0.1, lambda_V * (2.0 - sesgo_V))
+        else:
             lambdas[nom_L][metrica] = lambda_L
             lambdas[nom_V][metrica] = lambda_V
             
     return lambdas, nom_L, nom_V
 
 # =====================================================================
-# MÓDULO 4: MOTOR MONTE CARLO Y FORZADO FÍSICO
+# MÓDULO 4: MOTOR MONTE CARLO Y MERCADOS FINANCIEROS
 # =====================================================================
 def ejecutar_transporte_montecarlo(lambdas, local, visitante, historias=100000):
-    print(f"[4/4] Transportando {historias:,} historias con forzado termodinámico...\n")
+    print(f"\n[4/4] Transportando {historias:,} historias con forzado termodinámico...\n")
     
     tally_L = {k: np.random.poisson(lam, historias) for k, lam in lambdas[local].items()}
     tally_V = {k: np.random.poisson(lam, historias) for k, lam in lambdas[visitante].items()}
     
-    # --- LA LEY DE CONSERVACIÓN FÍSICA DEL FÚTBOL ---
+    # --- LA LEY DE CONSERVACIÓN FÍSICA ---
     for eq in [tally_L, tally_V]:
-        # 1. Los tiros a puerta no pueden ser mayores que los tiros totales
         eq['on_target'] = np.minimum(eq['on_target'], eq['shots'])
-        # 2. Los palos no pueden ser mayores que los tiros que NO van a puerta
         tiros_fuera = eq['shots'] - eq['on_target']
         eq['woodwork'] = np.minimum(eq['woodwork'], tiros_fuera)
-        # 3. Los goles no pueden ser mayores que los tiros a puerta
         eq['goals'] = np.minimum(eq['goals'], eq['on_target'])
 
     # --- RENDERIZADO DEL DASHBOARD FINAL ---
-    print("=" * 75)
+    print("=" * 85)
     print(f" ⚽ GEMELO DIGITAL: {local} (L) vs {visitante} (V)")
-    print("=" * 75)
+    print("=" * 85)
     print(f"{'Variable de Cascada (Media por partido)':<42} | {local:<12} | {visitante:<12}")
-    print("-" * 75)
+    print("-" * 85)
     
     metricas_mostrar = {
         'goals': 'Goles',
@@ -168,39 +202,75 @@ def ejecutar_transporte_montecarlo(lambdas, local, visitante, historias=100000):
         media_V = np.mean(tally_V[clave])
         print(f"{nombre:<42} | {media_L:<12.2f} | {media_V:<12.2f}")
         
-    print("-" * 75)
-    print(" 📊 PROBABILIDADES CUÁNTICAS DE SUCESOS (Mercado 1X2)")
-    print("-" * 75)
+    print("-" * 85)
+    print(" 📊 PROBABILIDADES CUÁNTICAS Y CUOTAS DE VALOR (Payout 91.5%)")
+    print("-" * 85)
     
+    def calcular_cuota(probabilidad):
+        if probabilidad <= 0: return 0.00
+        return 91.5 / probabilidad
+
+    # --- 1. MERCADO PRINCIPAL (GOLES) ---
     p_1 = np.mean(tally_L['goals'] > tally_V['goals']) * 100
     p_x = np.mean(tally_L['goals'] == tally_V['goals']) * 100
     p_2 = np.mean(tally_L['goals'] < tally_V['goals']) * 100
-    p_over = np.mean((tally_L['goals'] + tally_V['goals']) >= 3) * 100
+    p_over = np.mean((tally_L['goals'] + tally_V['goals']) >= 3) * 100 
     p_ambos = np.mean((tally_L['goals'] > 0) & (tally_V['goals'] > 0)) * 100
     
-    print(f" [1] Victoria Local ({local}):  {p_1:>6.2f} %")
-    print(f" [X] Empate:                 {p_x:>6.2f} %")
-    print(f" [2] Victoria Visitante ({visitante}):{p_2:>6.2f} %")
-    print(f" [*] Más de 2.5 Goles en total:      {p_over:>6.2f} %")
-    print(f" [*] Ambos equipos marcan:    {p_ambos:>6.2f} %")
-    print("=" * 75)
+    print(" [MERCADO DE GOLES]")
+    print(f" [1] Victoria Local:          {p_1:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_1):>5.2f}")
+    print(f" [X] Empate:                  {p_x:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_x):>5.2f}")
+    print(f" [2] Victoria Visitante:      {p_2:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_2):>5.2f}")
+    print(f" [*] Más de 2.5 Goles:        {p_over:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_over):>5.2f}")
+    print(f" [*] Ambos Marcan:            {p_ambos:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_ambos):>5.2f}")
+    
+    # --- 2. MERCADO DE CÓRNERS ---
+    p_corn_1 = np.mean(tally_L['corners'] > tally_V['corners']) * 100
+    p_corn_x = np.mean(tally_L['corners'] == tally_V['corners']) * 100
+    p_corn_2 = np.mean(tally_L['corners'] < tally_V['corners']) * 100
+    p_corn_over = np.mean((tally_L['corners'] + tally_V['corners']) >= 9) * 100 
+    
+    print("\n [MERCADO DE CÓRNERS]")
+    print(f" [1] Más Córners Local:       {p_corn_1:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_corn_1):>5.2f}")
+    print(f" [X] Empate a Córners:        {p_corn_x:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_corn_x):>5.2f}")
+    print(f" [2] Más Córners Visitante:   {p_corn_2:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_corn_2):>5.2f}")
+    print(f" [*] Más de 8.5 Córners:      {p_corn_over:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_corn_over):>5.2f}")
+
+    # --- 3. MERCADO DE TARJETAS ---
+    p_card_1 = np.mean(tally_L['cards'] > tally_V['cards']) * 100
+    p_card_x = np.mean(tally_L['cards'] == tally_V['cards']) * 100
+    p_card_2 = np.mean(tally_L['cards'] < tally_V['cards']) * 100
+    p_card_over = np.mean((tally_L['cards'] + tally_V['cards']) >= 6) * 100 
+    
+    print("\n [MERCADO DE TARJETAS]")
+    print(f" [1] Más Tarjetas Local:      {p_card_1:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_card_1):>5.2f}")
+    print(f" [X] Empate a Tarjetas:       {p_card_x:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_card_x):>5.2f}")
+    print(f" [2] Más Tarjetas Visitante:  {p_card_2:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_card_2):>5.2f}")
+    print(f" [*] Más de 5.5 Tarjetas:     {p_card_over:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_card_over):>5.2f}")
+
+    # --- 4. MERCADO DE TIROS A PUERTA ---
+    p_sot_1 = np.mean(tally_L['on_target'] > tally_V['on_target']) * 100
+    p_sot_2 = np.mean(tally_L['on_target'] < tally_V['on_target']) * 100
+    p_sot_over = np.mean((tally_L['on_target'] + tally_V['on_target']) >= 8) * 100 
+    
+    print("\n [MERCADO DE TIROS A PUERTA]")
+    print(f" [1] Más a Puerta Local:      {p_sot_1:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_sot_1):>5.2f}")
+    print(f" [2] Más a Puerta Visitante:  {p_sot_2:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_sot_2):>5.2f}")
+    print(f" [*] Más de 7.5 a Puerta:     {p_sot_over:>6.2f} %  -> Cuota Exigible: {calcular_cuota(p_sot_over):>5.2f}")
+    print("=" * 85)
 
 # =====================================================================
 # EJECUCIÓN (SISTEMA DE ARRANQUE)
 # =====================================================================
 if __name__ == "__main__":
     try:
-        # 1. Cargamos el combustible (Datos y Matrices)
         crudos = descargar_matriz_laliga()
         matriz = estructurar_fisica_de_particulas(crudos)
         
-        # 2. Definimos los materiales objetivo
-        # Nota: Asegúrate de que los nombres coincidan aproximadamente con los de LaLiga
         EQUIPO_LOCAL = "CD Leganés" 
         EQUIPO_VISITANTE = "SD Huesca"
         
-        # 3. Lanzamos la simulación
-        lambdas_partido, nom_L, nom_V = calcular_lambdas_por_bosque(matriz, EQUIPO_LOCAL, EQUIPO_VISITANTE)
+        lambdas_partido, nom_L, nom_V = calcular_lambdas_xgboost(matriz, crudos, EQUIPO_LOCAL, EQUIPO_VISITANTE)
         ejecutar_transporte_montecarlo(lambdas_partido, nom_L, nom_V, historias=100000)
         
     except Exception as e:
