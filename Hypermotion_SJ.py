@@ -3,7 +3,7 @@ import json
 import pandas as pd
 import numpy as np
 from bs4 import BeautifulSoup
-from xgboost import XGBRegressor # EL NUEVO MOTOR FÓRMULA 1
+from xgboost import XGBRegressor
 import time
 
 # =====================================================================
